@@ -2,7 +2,7 @@
 
 # Pylint doesn't understand many dynamic pygame attributes/constants.
 # pylint: disable=no-member,missing-function-docstring
-hi
+
 from __future__ import annotations
 
 from dataclasses import dataclass
