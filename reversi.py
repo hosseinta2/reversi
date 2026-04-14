@@ -606,7 +606,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     # --------------------------------------------------------
     def run(self) -> None:  # pylint: disable=too-many-branches
         running = True
-
+    
         while running:
             self.clock.tick(FPS)
 
