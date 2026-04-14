@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import math
 import numpy as np
 import pygame
 
@@ -19,6 +20,7 @@ from reversi_engine import (
     ReversiState,
     WHITE as ENGINE_WHITE,
     apply_action as engine_apply_action,
+    PASS_MOVE as ENGINE_PASS_MOVE,
 )
 
 
@@ -33,6 +35,7 @@ WINDOW_HEIGHT = BOARD_PIXELS
 BOARD_SIZE = 8
 SQ_SIZE = BOARD_PIXELS // BOARD_SIZE
 FPS = 60
+FLIP_ANIM_MS = 320
 
 BOARD_LIGHT = (22, 112, 54)
 BOARD_DARK = (18, 92, 45)
@@ -42,6 +45,14 @@ BG = (26, 26, 26)
 
 PANEL_BG = (38, 40, 44)
 PANEL_BORDER = (68, 72, 78)
+SCROLLBAR_WIDTH = 10
+SCROLLBAR_PAD = 4
+SCROLLBAR_TRACK = (52, 54, 58)
+SCROLLBAR_THUMB = (120, 125, 135)
+SCROLLBAR_THUMB_HOVER = (150, 155, 165)
+# Cap move list height so it does not crowd help text and buttons below.
+MOVES_LIST_MAX_HEIGHT = 168
+MOVES_LIST_BOTTOM_GAP = 32
 TEXT = (235, 235, 235)
 SUBTEXT = (180, 180, 180)
 ACCENT = (86, 156, 214)
@@ -96,10 +107,16 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.engine_status = 'Engine unavailable (no trained weights)'
         self.engine_cache_key: Optional[Tuple[int, int]] = None
         self.engine_lines: List[Tuple[List[str], float]] = []
+        self.play_vs_engine = False
+        self._vs_engine_delay_until: Optional[int] = None
 
-        self.engine_net = PolicyValueNet(hidden_size=128, learning_rate=0.01, seed=42)
-        self.engine_mcts = MCTS(self.engine_net, simulations=64)
-        self._try_load_engine_weights()
+        self.flip_anim_for_index: Optional[int] = None
+        self.flip_anim_cells: List[Tuple[int, int, int, int]] = []
+        self.flip_anim_start_ms: int = 0
+
+        self.engine_net: PolicyValueNet
+        self.engine_mcts: MCTS
+        self._init_engine_network()
 
         panel_x = BOARD_PIXELS
         margin = 16
@@ -109,7 +126,21 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         self.back_button = pygame.Rect(panel_x + margin, btn_y, btn_w, btn_h)
         self.forward_button = pygame.Rect(panel_x + 2 * margin + btn_w, btn_y, btn_w, btn_h)
-        self.engine_button = pygame.Rect(panel_x + margin, btn_y - btn_h - 10, PANEL_WIDTH - 2 * margin, btn_h)
+        btn_gap = 8
+        self.engine_button = pygame.Rect(
+            panel_x + margin, btn_y - btn_h - btn_gap, PANEL_WIDTH - 2 * margin, btn_h
+        )
+        self.play_vs_engine_button = pygame.Rect(
+            panel_x + margin,
+            self.engine_button.top - btn_h - btn_gap,
+            PANEL_WIDTH - 2 * margin,
+            btn_h,
+        )
+
+        self.moves_scroll = 0
+        self.moves_scroll_dragging = False
+        self._scroll_drag_s0 = 0
+        self._scroll_drag_my0 = 0
 
     # --------------------------------------------------------
     # Core helpers
@@ -201,18 +232,27 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     def move_to_label(self, row: int, col: int) -> str:
         return f'{FILES[col]}{row + 1}'
 
-    def _try_load_engine_weights(self) -> None:
+    def _init_engine_network(self) -> None:
+        """Build PolicyValueNet to match saved weights (hidden size from checkpoint)."""
         try:
             data = np.load(WEIGHTS_FILE)
-            self.engine_net.w1 = data['w1']
+            w1 = data['w1']
+            hidden_size = int(w1.shape[1])
+            self.engine_net = PolicyValueNet(
+                hidden_size=hidden_size, learning_rate=0.01, seed=42
+            )
+            self.engine_net.w1 = w1
             self.engine_net.b1 = data['b1']
             self.engine_net.wp = data['wp']
             self.engine_net.bp = data['bp']
             self.engine_net.wv = data['wv']
             self.engine_net.bv = data['bv']
+            self.engine_mcts = MCTS(self.engine_net, simulations=96)
             self.engine_ready = True
             self.engine_status = 'Engine ready'
         except (OSError, KeyError, ValueError):
+            self.engine_net = PolicyValueNet(hidden_size=128, learning_rate=0.01, seed=42)
+            self.engine_mcts = MCTS(self.engine_net, simulations=64)
             self.engine_ready = False
             self.engine_enabled = False
             self.engine_status = f'Engine unavailable ({WEIGHTS_FILE.name} not found)'
@@ -276,7 +316,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.engine_cache_key = cache_key
         self.engine_lines = []
 
-        if not self.engine_enabled or not self.engine_ready or self.is_game_over(state):
+        if (
+            not self.engine_enabled
+            or self.play_vs_engine
+            or not self.engine_ready
+            or self.is_game_over(state)
+        ):
             return
 
         legal_moves = self.valid_moves(state.board, state.current_player)
@@ -295,10 +340,18 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
     def make_move(self, row: int, col: int) -> None:
         state = self.current_state()
+        human_just_played_black = self.play_vs_engine and state.current_player == BLACK
         legal_moves = self.valid_moves(state.board, state.current_player)
         flips = legal_moves.get((row, col))
         if not flips:
             return
+
+        self._clear_flip_animation()
+        opponent = -state.current_player
+        anim_cells: List[Tuple[int, int, int, int]] = [
+            (fr, fc, opponent, state.current_player) for fr, fc in flips
+        ]
+        anim_cells.append((row, col, EMPTY, state.current_player))
 
         new_board = self.copy_board(state.board)
         new_board[row][col] = state.current_player
@@ -315,23 +368,90 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             self.push_state(self.copy_board(new_board), state.current_player, 'pass')
         self.engine_cache_key = None
 
+        if human_just_played_black and self.play_vs_engine and self.is_live_view():
+            if self.live_state().current_player == WHITE:
+                self._vs_engine_delay_until = pygame.time.get_ticks() + 500
+
+        self.flip_anim_cells = anim_cells
+        self.flip_anim_start_ms = pygame.time.get_ticks()
+        self.flip_anim_for_index = self.current_index
+
     def go_back(self) -> None:
         if self.current_index > 0:
             self.current_index -= 1
             self.selected_square = None
             self.engine_cache_key = None
+            self._clear_flip_animation()
 
     def go_forward(self) -> None:
         if self.current_index < len(self.history) - 1:
             self.current_index += 1
             self.selected_square = None
             self.engine_cache_key = None
+            self._clear_flip_animation()
 
     def reset_game(self) -> None:
         self.history = [GameState(self.initial_board(), BLACK, None)]
         self.current_index = 0
         self.selected_square = None
         self.engine_cache_key = None
+        self.play_vs_engine = False
+        self.moves_scroll = 0
+        self.moves_scroll_dragging = False
+        self._vs_engine_delay_until = None
+        self._clear_flip_animation()
+
+    def _clear_flip_animation(self) -> None:
+        self.flip_anim_for_index = None
+        self.flip_anim_cells = []
+
+    def _best_engine_action(self, state: GameState) -> int:
+        engine_state = self._state_to_engine(state)
+        policy = self.engine_mcts.run(engine_state, temperature=0.0)
+        return int(np.argmax(policy))
+
+    def play_engine_turn(self) -> None:
+        """Play one move for White when in vs-engine mode (human is Black)."""
+        if not self.play_vs_engine or not self.engine_ready:
+            return
+        state = self.live_state()
+        if state.current_player != WHITE:
+            return
+
+        legal = self.valid_moves(state.board, WHITE)
+        if not legal:
+            black_legal = self.valid_moves(state.board, BLACK)
+            if not black_legal:
+                return
+            self.push_state(self.copy_board(state.board), BLACK, 'pass')
+            self.engine_cache_key = None
+            return
+
+        action = self._best_engine_action(state)
+        if action == ENGINE_PASS_MOVE or action >= BOARD_SIZE * BOARD_SIZE:
+            row, col = next(iter(legal))
+        else:
+            row, col = divmod(action, BOARD_SIZE)
+            if (row, col) not in legal:
+                row, col = next(iter(legal))
+
+        self.make_move(row, col)
+
+    def maybe_play_engine_move(self) -> None:
+        if not self.play_vs_engine or not self.engine_ready:
+            self._vs_engine_delay_until = None
+            return
+        if not self.is_live_view() or self.is_game_over():
+            self._vs_engine_delay_until = None
+            return
+        if self.live_state().current_player != WHITE:
+            self._vs_engine_delay_until = None
+            return
+        if self._vs_engine_delay_until is not None:
+            if pygame.time.get_ticks() < self._vs_engine_delay_until:
+                return
+            self._vs_engine_delay_until = None
+        self.play_engine_turn()
 
     # --------------------------------------------------------
     # Move list helpers
@@ -390,6 +510,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         state = self.current_state()
         if self.is_game_over(state):
             return
+        if self.play_vs_engine and self.is_live_view() and state.current_player == WHITE:
+            return
 
         dot_color = BLACK_DISK if state.current_player == BLACK else WHITE_DISK
         dot_border = (220, 220, 220) if state.current_player == BLACK else (60, 60, 60)
@@ -415,12 +537,89 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         pygame.draw.circle(self.screen, disk_color, center, radius)
         pygame.draw.circle(self.screen, rim_color, center, radius, width=2)
 
+    def _disk_colors(self, color: int) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+        disk_color = BLACK_DISK if color == BLACK else WHITE_DISK
+        rim_color = (220, 220, 220) if color == BLACK else (60, 60, 60)
+        return disk_color, rim_color
+
+    def draw_disk_elliptical(self, row: int, col: int, color: int, x_scale: float) -> None:
+        """Draw a disk squashed horizontally (0–1) for a flip illusion."""
+        x_scale = max(0.06, min(1.0, x_scale))
+        x, y = self.square_to_screen(row, col)
+        cx = x + SQ_SIZE // 2
+        cy = y + SQ_SIZE // 2
+        radius = SQ_SIZE // 2 - 8
+        rx = max(2, int(radius * x_scale))
+        ry = radius
+        disk_color, rim_color = self._disk_colors(color)
+        rect = pygame.Rect(cx - rx, cy - ry, 2 * rx, 2 * ry)
+
+        shadow = pygame.Surface((SQ_SIZE, SQ_SIZE), pygame.SRCALPHA)
+        shrx = max(2, int((SQ_SIZE // 2 - 2) * x_scale))
+        pygame.draw.ellipse(
+            shadow, SHADOW, (SQ_SIZE // 2 - shrx + 1, SQ_SIZE // 2 - ry + 3, 2 * shrx, 2 * ry)
+        )
+        self.screen.blit(shadow, (x, y))
+
+        pygame.draw.ellipse(self.screen, disk_color, rect)
+        pygame.draw.ellipse(self.screen, rim_color, rect, width=2)
+
+    def draw_disk_pop_in(self, row: int, col: int, color: int, scale: float) -> None:
+        """New stone scales up from the center."""
+        scale = max(0.0, min(1.0, scale))
+        if scale <= 0.02:
+            return
+        x, y = self.square_to_screen(row, col)
+        cx = x + SQ_SIZE // 2
+        cy = y + SQ_SIZE // 2
+        radius = int((SQ_SIZE // 2 - 8) * scale)
+        if radius < 2:
+            return
+        disk_color, rim_color = self._disk_colors(color)
+
+        shadow = pygame.Surface((SQ_SIZE, SQ_SIZE), pygame.SRCALPHA)
+        pygame.draw.circle(shadow, SHADOW, (SQ_SIZE // 2 + 2, SQ_SIZE // 2 + 4), radius)
+        self.screen.blit(shadow, (x, y))
+
+        pygame.draw.circle(self.screen, disk_color, (cx, cy), radius)
+        pygame.draw.circle(self.screen, rim_color, (cx, cy), radius, width=2)
+
+    def _flip_animation_progress(self) -> Optional[float]:
+        if self.flip_anim_for_index is None or not self.flip_anim_cells:
+            return None
+        if self.current_index != self.flip_anim_for_index:
+            return None
+        elapsed = pygame.time.get_ticks() - self.flip_anim_start_ms
+        if elapsed >= FLIP_ANIM_MS:
+            self._clear_flip_animation()
+            return None
+        return elapsed / FLIP_ANIM_MS
+
+    def draw_piece_animated(self, row: int, col: int, from_c: int, to_c: int, t: float) -> None:
+        if from_c == EMPTY:
+            ease = 1.0 - (1.0 - t) ** 3
+            self.draw_disk_pop_in(row, col, to_c, ease)
+        else:
+            squash = abs(math.cos(math.pi * t))
+            color = from_c if t < 0.5 else to_c
+            self.draw_disk_elliptical(row, col, color, squash)
+
     def draw_pieces(self) -> None:
         board = self.current_state().board
+        t_anim = self._flip_animation_progress()
+        anim_map: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        if t_anim is not None:
+            anim_map = {(r, c): (fc, tc) for r, c, fc, tc in self.flip_anim_cells}
+
         for row in range(BOARD_SIZE):
             for col in range(BOARD_SIZE):
-                if board[row][col] != EMPTY:
-                    self.draw_disk(row, col, board[row][col])
+                piece = board[row][col]
+                key = (row, col)
+                if key in anim_map and t_anim is not None:
+                    fc, tc = anim_map[key]
+                    self.draw_piece_animated(row, col, fc, tc, t_anim)
+                elif piece != EMPTY:
+                    self.draw_disk(row, col, piece)
 
     def draw_game_over(self) -> None:
         state = self.current_state()
@@ -492,7 +691,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.screen.blit(turn_surface, (panel_x, y))
         y += 26
 
-        if self.engine_enabled and self.engine_ready and not self.is_game_over(state):
+        if (
+            self.engine_enabled
+            and not self.play_vs_engine
+            and self.engine_ready
+            and not self.is_game_over(state)
+        ):
             if not self.engine_lines:
                 self.screen.blit(self.font_small.render('Lines: pass', True, TEXT), (panel_x, y))
                 y += 20
@@ -506,6 +710,11 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         else:
             y += 8
 
+        if self.play_vs_engine and self.engine_ready and not self.is_game_over(state):
+            vs_txt = self.font_small.render('You: Black · Engine: White', True, SUBTEXT)
+            self.screen.blit(vs_txt, (panel_x, y))
+            y += 22
+
         pygame.draw.line(
             self.screen,
             PANEL_BORDER,
@@ -517,24 +726,59 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         rows = self.get_move_rows()
         row_height = 28
-        available_height = self.back_button.top - y - 10
-        max_rows = max(1, available_height // row_height)
+        moves_list_top = y
+        safe_available = max(0, self.back_button.top - moves_list_top - MOVES_LIST_BOTTOM_GAP)
+        available_height = min(MOVES_LIST_MAX_HEIGHT, safe_available)
+        if available_height < row_height:
+            available_height = safe_available
+        max_visible = max(1, available_height // row_height)
+        total_rows = len(rows)
+        max_scroll = max(0, total_rows - max_visible)
+        self.moves_scroll = min(max(self.moves_scroll, 0), max_scroll)
+        start_row = self.moves_scroll
+        end_row = min(total_rows, start_row + max_visible)
 
-        current_row = 0 if self.current_index == 0 else (self.current_index - 1) // 2
-        start_row = max(0, current_row - max_rows + 3)
-        end_row = min(len(rows), start_row + max_rows)
+        list_clip_w = PANEL_WIDTH - 24 - SCROLLBAR_WIDTH - SCROLLBAR_PAD
+        clip_rect = pygame.Rect(BOARD_PIXELS + 12, moves_list_top, list_clip_w, available_height)
+        track_x = clip_rect.right + SCROLLBAR_PAD
+        track_rect = pygame.Rect(track_x, moves_list_top, SCROLLBAR_WIDTH, available_height)
+
+        self._moves_list_clip_rect = clip_rect
+        self._scrollbar_track_rect = track_rect
+        self._scrollbar_max_scroll = max_scroll
+        self._max_visible_moves = max_visible
+
+        thumb_h = available_height
+        if max_scroll > 0 and total_rows > 0:
+            thumb_h = max(24, int(available_height * max_visible / total_rows))
+        thumb_h = min(thumb_h, available_height)
+        span = max(1, available_height - thumb_h)
+        thumb_y = track_rect.y
+        if max_scroll > 0:
+            thumb_y = track_rect.y + int((self.moves_scroll / max_scroll) * span)
+        thumb_rect = pygame.Rect(track_rect.x, thumb_y, SCROLLBAR_WIDTH, thumb_h)
+        self._scrollbar_thumb_rect = thumb_rect
+        self._scrollbar_thumb_h = thumb_h
+        self._scrollbar_span = span
+
+        pygame.draw.rect(self.screen, SCROLLBAR_TRACK, track_rect, border_radius=4)
+        pygame.draw.rect(self.screen, PANEL_BORDER, track_rect, width=1, border_radius=4)
+        pygame.draw.rect(self.screen, SCROLLBAR_THUMB, thumb_rect, border_radius=4)
+        pygame.draw.rect(self.screen, PANEL_BORDER, thumb_rect, width=1, border_radius=4)
 
         col1 = panel_x
         col2 = panel_x + 40
         col3 = panel_x + 130
 
+        old_clip = self.screen.get_clip()
+        self.screen.set_clip(clip_rect)
         for row_i in range(start_row, end_row):
             move_no, black_move, white_move, black_idx, white_idx = rows[row_i]
-            row_y = y + (row_i - start_row) * row_height
+            row_y = moves_list_top + (row_i - start_row) * row_height
 
             if self.current_index in (black_idx, white_idx):
                 highlight_rect = pygame.Rect(
-                    BOARD_PIXELS + 10, row_y - 2, PANEL_WIDTH - 20, row_height - 2
+                    clip_rect.x, row_y - 2, clip_rect.width, row_height - 2
                 )
                 pygame.draw.rect(self.screen, ROW_HIGHLIGHT, highlight_rect, border_radius=6)
 
@@ -551,27 +795,83 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                 white_txt = self.font_body.render(white_move, True, white_color)
                 self.screen.blit(white_txt, (col3, row_y + 2))
 
+        self.screen.set_clip(old_clip)
+
         self.draw_button(self.back_button, 'Back', self.current_index > 0)
         self.draw_button(
             self.forward_button, 'Forward', self.current_index < len(self.history) - 1
         )
         if self.engine_ready:
-            engine_label = 'Engine: ON' if self.engine_enabled else 'Engine: OFF'
-            self.draw_button(self.engine_button, engine_label, True)
+            play_label = 'Vs engine: ON' if self.play_vs_engine else 'Vs engine: OFF'
+            self.draw_button(self.play_vs_engine_button, play_label, True)
+            if self.play_vs_engine:
+                self.draw_button(self.engine_button, 'Hints: off (vs mode)', False)
+            else:
+                engine_label = 'Hints: ON' if self.engine_enabled else 'Hints: OFF'
+                self.draw_button(self.engine_button, engine_label, True)
         else:
+            self.draw_button(self.play_vs_engine_button, 'Play vs engine', False)
             self.draw_button(self.engine_button, 'Engine unavailable', False)
 
         help_text = self.font_small.render('Click a dot to place, R to reset', True, SUBTEXT)
         help_rect = help_text.get_rect(
-            midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.engine_button.top - 10)
+            midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.play_vs_engine_button.top - 10)
         )
         self.screen.blit(help_text, help_rect)
 
     # --------------------------------------------------------
     # Interaction
     # --------------------------------------------------------
+    def handle_moves_scrollbar_mouse_down(self, pos: Tuple[int, int]) -> bool:
+        if not hasattr(self, '_scrollbar_track_rect') or self._scrollbar_track_rect.width <= 0:
+            return False
+        if not self._scrollbar_track_rect.collidepoint(pos):
+            return False
+        if self._scrollbar_max_scroll <= 0:
+            return True
+
+        if self._scrollbar_thumb_rect.collidepoint(pos):
+            self.moves_scroll_dragging = True
+            self._scroll_drag_s0 = self.moves_scroll
+            self._scroll_drag_my0 = pos[1]
+        else:
+            page = max(1, self._max_visible_moves)
+            if pos[1] < self._scrollbar_thumb_rect.centery:
+                self.moves_scroll = max(0, self.moves_scroll - page)
+            else:
+                self.moves_scroll = min(self._scrollbar_max_scroll, self.moves_scroll + page)
+        return True
+
+    def update_moves_scroll_drag(self) -> None:
+        if not self.moves_scroll_dragging:
+            return
+        if not pygame.mouse.get_pressed()[0]:
+            self.moves_scroll_dragging = False
+            return
+        max_scroll = self._scrollbar_max_scroll
+        if max_scroll <= 0:
+            self.moves_scroll_dragging = False
+            return
+        span = self._scrollbar_span
+        dy = pygame.mouse.get_pos()[1] - self._scroll_drag_my0
+        delta = int(round((dy / span) * max_scroll))
+        self.moves_scroll = min(max(self._scroll_drag_s0 + delta, 0), max_scroll)
+
+    def handle_moves_scroll_wheel(self, event: pygame.event.Event) -> None:
+        if not hasattr(self, '_moves_list_clip_rect') or self._moves_list_clip_rect.height <= 0:
+            return
+        wheel_rect = self._moves_list_clip_rect.union(self._scrollbar_track_rect)
+        if not wheel_rect.collidepoint(pygame.mouse.get_pos()):
+            return
+        delta = getattr(event, 'y', 0)
+        max_scroll = max(0, getattr(self, '_scrollbar_max_scroll', 0))
+        self.moves_scroll -= int(delta) * 2
+        self.moves_scroll = min(max(self.moves_scroll, 0), max_scroll)
+
     def try_place_disk(self, pos: Tuple[int, int]) -> None:
         if self.is_game_over():
+            return
+        if self.play_vs_engine and self.is_live_view() and self.live_state().current_player != BLACK:
             return
 
         square = self.screen_to_square(pos)
@@ -582,7 +882,20 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.make_move(row, col)
 
     def handle_mouse_down(self, pos: Tuple[int, int]) -> None:
+        if self.play_vs_engine_button.collidepoint(pos) and self.engine_ready:
+            self.play_vs_engine = not self.play_vs_engine
+            if self.play_vs_engine:
+                self.engine_enabled = False
+                if self.is_live_view() and self.live_state().current_player == WHITE:
+                    self._vs_engine_delay_until = pygame.time.get_ticks() + 500
+            else:
+                self._vs_engine_delay_until = None
+            self.engine_cache_key = None
+            return
+
         if self.engine_button.collidepoint(pos) and self.engine_ready:
+            if self.play_vs_engine:
+                return
             self.engine_enabled = not self.engine_enabled
             self.engine_cache_key = None
             return
@@ -593,6 +906,9 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         if self.forward_button.collidepoint(pos) and self.current_index < len(self.history) - 1:
             self.go_forward()
+            return
+
+        if pos[0] >= BOARD_PIXELS and self.handle_moves_scrollbar_mouse_down(pos):
             return
 
         if pos[0] < BOARD_PIXELS:
@@ -623,6 +939,16 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_mouse_down(event.pos)
+
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    self.moves_scroll_dragging = False
+
+                elif hasattr(pygame, 'MOUSEWHEEL') and event.type == pygame.MOUSEWHEEL:
+                    self.handle_moves_scroll_wheel(event)
+
+            self.update_moves_scroll_drag()
+
+            self.maybe_play_engine_move()
 
             self.draw_board()
             self.draw_pieces()

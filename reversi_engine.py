@@ -306,7 +306,8 @@ class SelfPlayTrainer:
 
         move_index = 0
         while not is_terminal(state):
-            temperature = 1.0 if move_index < 12 else 0.2
+            # More exploration early, sharper policy later for stronger targets.
+            temperature = 1.0 if move_index < 16 else 0.25
             policy = self.mcts.run(state, temperature=temperature)
 
             game_states.append(encode_state(state))
@@ -329,7 +330,15 @@ class SelfPlayTrainer:
             outcomes,
         )
 
-    def train(self, iterations: int = 20, games_per_iteration: int = 8, batch_size: int = 64) -> None:
+    def train(
+        self,
+        iterations: int = 20,
+        games_per_iteration: int = 8,
+        batch_size: int = 64,
+        lr_decay: float = 0.985,
+        max_replay_samples: int = 120_000,
+        epochs_per_iteration: int = 2,
+    ) -> None:
         replay_states: List[np.ndarray] = []
         replay_masks: List[np.ndarray] = []
         replay_policies: List[np.ndarray] = []
@@ -348,28 +357,52 @@ class SelfPlayTrainer:
             policies_all = np.concatenate(replay_policies, axis=0)
             values_all = np.concatenate(replay_values, axis=0)
 
-            idx = np.random.permutation(states_all.shape[0])
+            n = states_all.shape[0]
+            if n > max_replay_samples:
+                pick = np.random.choice(n, size=max_replay_samples, replace=False)
+                states_all = states_all[pick]
+                masks_all = masks_all[pick]
+                policies_all = policies_all[pick]
+                values_all = values_all[pick]
+                n = max_replay_samples
+
+            if it > 1:
+                self.net.lr *= lr_decay
+
             epoch_loss = 0.0
             batches = 0
+            for _epoch in range(epochs_per_iteration):
+                idx = np.random.permutation(n)
+                for start in range(0, n, batch_size):
+                    batch_idx = idx[start:start + batch_size]
+                    loss = self.net.train_batch(
+                        states_all[batch_idx],
+                        policies_all[batch_idx],
+                        values_all[batch_idx],
+                        masks_all[batch_idx],
+                    )
+                    epoch_loss += loss
+                    batches += 1
 
-            for start in range(0, len(idx), batch_size):
-                batch_idx = idx[start:start + batch_size]
-                loss = self.net.train_batch(
-                    states_all[batch_idx],
-                    policies_all[batch_idx],
-                    values_all[batch_idx],
-                    masks_all[batch_idx],
-                )
-                epoch_loss += loss
-                batches += 1
-
-            print(f"Iteration {it:02d} | samples={len(idx):4d} | loss={epoch_loss / max(1, batches):.4f}")
+            print(
+                f"Iteration {it:02d} | samples={n:5d} | lr={self.net.lr:.5f} | "
+                f"loss={epoch_loss / max(1, batches):.4f}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":
-    network = PolicyValueNet(hidden_size=128, learning_rate=0.01, seed=42)
-    trainer = SelfPlayTrainer(network, simulations=64)
-    trainer.train(iterations=10, games_per_iteration=4, batch_size=64)
+    # Stronger defaults: wider net, more self-play, deeper MCTS, replay subsampling + LR decay.
+    network = PolicyValueNet(hidden_size=192, learning_rate=0.008, seed=42)
+    trainer = SelfPlayTrainer(network, simulations=96)
+    trainer.train(
+        iterations=14,
+        games_per_iteration=8,
+        batch_size=96,
+        lr_decay=0.985,
+        max_replay_samples=120_000,
+        epochs_per_iteration=2,
+    )
     weights_file = Path(__file__).with_name('reversi_engine_weights.npz')
     np.savez(
         weights_file,
