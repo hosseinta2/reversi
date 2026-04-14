@@ -6,9 +6,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import pygame
+
+from reversi_engine import (
+    BLACK as ENGINE_BLACK,
+    MCTS,
+    PolicyValueNet,
+    ReversiState,
+    WHITE as ENGINE_WHITE,
+    apply_action as engine_apply_action,
+)
 
 
 # ============================================================
@@ -50,6 +61,7 @@ DIRECTIONS = [
     (1, -1),  (1, 0),  (1, 1),
 ]
 FILES = 'abcdefgh'
+WEIGHTS_FILE = Path(__file__).with_name('reversi_engine_weights.npz')
 
 
 @dataclass
@@ -79,6 +91,15 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.history: List[GameState] = [GameState(self.initial_board(), BLACK, None)]
         self.current_index = 0
         self.selected_square: Optional[Tuple[int, int]] = None
+        self.engine_enabled = False
+        self.engine_ready = False
+        self.engine_status = 'Engine unavailable (no trained weights)'
+        self.engine_cache_key: Optional[Tuple[int, int]] = None
+        self.engine_lines: List[Tuple[List[str], float]] = []
+
+        self.engine_net = PolicyValueNet(hidden_size=128, learning_rate=0.01, seed=42)
+        self.engine_mcts = MCTS(self.engine_net, simulations=64)
+        self._try_load_engine_weights()
 
         panel_x = BOARD_PIXELS
         margin = 16
@@ -88,6 +109,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         self.back_button = pygame.Rect(panel_x + margin, btn_y, btn_w, btn_h)
         self.forward_button = pygame.Rect(panel_x + 2 * margin + btn_w, btn_y, btn_w, btn_h)
+        self.engine_button = pygame.Rect(panel_x + margin, btn_y - btn_h - 10, PANEL_WIDTH - 2 * margin, btn_h)
 
     # --------------------------------------------------------
     # Core helpers
@@ -179,6 +201,91 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     def move_to_label(self, row: int, col: int) -> str:
         return f'{FILES[col]}{row + 1}'
 
+    def _try_load_engine_weights(self) -> None:
+        try:
+            data = np.load(WEIGHTS_FILE)
+            self.engine_net.w1 = data['w1']
+            self.engine_net.b1 = data['b1']
+            self.engine_net.wp = data['wp']
+            self.engine_net.bp = data['bp']
+            self.engine_net.wv = data['wv']
+            self.engine_net.bv = data['bv']
+            self.engine_ready = True
+            self.engine_status = 'Engine ready'
+        except (OSError, KeyError, ValueError):
+            self.engine_ready = False
+            self.engine_enabled = False
+            self.engine_status = f'Engine unavailable ({WEIGHTS_FILE.name} not found)'
+
+    def _state_to_engine(self, state: GameState) -> ReversiState:
+        board_np = np.array(state.board, dtype=np.int8)
+        current_player = ENGINE_BLACK if state.current_player == BLACK else ENGINE_WHITE
+        return ReversiState(board=board_np, current_player=current_player)
+
+    def _action_to_label(self, action: int) -> str:
+        if action >= BOARD_SIZE * BOARD_SIZE:
+            return 'pass'
+        row, col = divmod(action, BOARD_SIZE)
+        return self.move_to_label(row, col)
+
+    def _top_actions(self, state: ReversiState, limit: int) -> List[int]:
+        policy = self.engine_mcts.run(state, temperature=1.0)
+        actions: List[int] = []
+        for action in np.argsort(policy)[::-1]:
+            action_int = int(action)
+            if policy[action_int] <= 0.0:
+                continue
+            if action_int < BOARD_SIZE * BOARD_SIZE and state.board.flat[action_int] != EMPTY:
+                continue
+            actions.append(action_int)
+            if len(actions) >= limit:
+                break
+        return actions
+
+    def _build_engine_lines(
+        self, state: GameState, line_count: int = 3, depth: int = 5
+    ) -> List[Tuple[List[str], float]]:
+        root = self._state_to_engine(state)
+        root_player = root.current_player
+        lines: List[Tuple[List[str], float]] = []
+
+        for first_action in self._top_actions(root, limit=line_count):
+            line_actions: List[str] = []
+            node = root
+            action = first_action
+            for _ in range(depth):
+                line_actions.append(self._action_to_label(action))
+                node = engine_apply_action(node, action)
+                next_actions = self._top_actions(node, limit=1)
+                if not next_actions:
+                    break
+                action = next_actions[0]
+
+            _, value = self.engine_net.predict(node)
+            line_eval = value if node.current_player == root_player else -value
+            lines.append((line_actions, line_eval))
+
+        return lines
+
+    def refresh_engine_hint(self) -> None:
+        state = self.current_state()
+        cache_key = (self.current_index, state.current_player)
+        if self.engine_cache_key == cache_key:
+            return
+
+        self.engine_cache_key = cache_key
+        self.engine_lines = []
+
+        if not self.engine_enabled or not self.engine_ready or self.is_game_over(state):
+            return
+
+        legal_moves = self.valid_moves(state.board, state.current_player)
+        if not legal_moves:
+            self.engine_status = 'Engine: pass'
+            return
+
+        self.engine_lines = self._build_engine_lines(state, line_count=3, depth=5)
+
     def push_state(self, board: List[List[int]], current_player: int, move_label: str) -> None:
         if not self.is_live_view():
             self.history = self.history[: self.current_index + 1]
@@ -209,21 +316,25 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         current_moves = self.valid_moves(new_board, state.current_player)
         if not next_moves and current_moves:
             self.push_state(self.copy_board(new_board), state.current_player, 'pass')
+        self.engine_cache_key = None
 
     def go_back(self) -> None:
         if self.current_index > 0:
             self.current_index -= 1
             self.selected_square = None
+            self.engine_cache_key = None
 
     def go_forward(self) -> None:
         if self.current_index < len(self.history) - 1:
             self.current_index += 1
             self.selected_square = None
+            self.engine_cache_key = None
 
     def reset_game(self) -> None:
         self.history = [GameState(self.initial_board(), BLACK, None)]
         self.current_index = 0
         self.selected_square = None
+        self.engine_cache_key = None
 
     # --------------------------------------------------------
     # Move list helpers
@@ -342,6 +453,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
     def draw_side_panel(self) -> None:  # pylint: disable=too-many-locals,too-many-statements
         state = self.current_state()
+        self.refresh_engine_hint()
         panel_rect = pygame.Rect(BOARD_PIXELS, 0, PANEL_WIDTH, WINDOW_HEIGHT)
         pygame.draw.rect(self.screen, PANEL_BG, panel_rect)
         pygame.draw.line(
@@ -381,7 +493,21 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         turn_surface = self.font_body.render(turn_text, True, TEXT)
         self.screen.blit(turn_surface, (panel_x, y))
-        y += 18
+        y += 26
+
+        if self.engine_enabled and self.engine_ready and not self.is_game_over(state):
+            if not self.engine_lines:
+                self.screen.blit(self.font_small.render('Lines: pass', True, TEXT), (panel_x, y))
+                y += 20
+            else:
+                for idx, (line_moves, line_eval) in enumerate(self.engine_lines, start=1):
+                    line_text = ' '.join(line_moves)
+                    render_text = f'{idx}) {line_text}  [{line_eval:+.3f}]'
+                    self.screen.blit(self.font_small.render(render_text, True, TEXT), (panel_x, y))
+                    y += 18
+            y += 8
+        else:
+            y += 8
 
         pygame.draw.line(
             self.screen,
@@ -432,10 +558,15 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.draw_button(
             self.forward_button, 'Forward', self.current_index < len(self.history) - 1
         )
+        if self.engine_ready:
+            engine_label = 'Engine: ON' if self.engine_enabled else 'Engine: OFF'
+            self.draw_button(self.engine_button, engine_label, True)
+        else:
+            self.draw_button(self.engine_button, 'Engine unavailable', False)
 
         help_text = self.font_small.render('Click a dot to place, R to reset', True, SUBTEXT)
         help_rect = help_text.get_rect(
-            midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.back_button.top - 10)
+            midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.engine_button.top - 10)
         )
         self.screen.blit(help_text, help_rect)
 
@@ -454,6 +585,11 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.make_move(row, col)
 
     def handle_mouse_down(self, pos: Tuple[int, int]) -> None:
+        if self.engine_button.collidepoint(pos) and self.engine_ready:
+            self.engine_enabled = not self.engine_enabled
+            self.engine_cache_key = None
+            return
+
         if self.back_button.collidepoint(pos) and self.current_index > 0:
             self.go_back()
             return
