@@ -294,10 +294,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.current_index = len(self.history) - 1
 
     def make_move(self, row: int, col: int) -> None:
-        if not self.is_live_view():
-            return
-
-        state = self.live_state()
+        state = self.current_state()
         legal_moves = self.valid_moves(state.board, state.current_player)
         flips = legal_moves.get((row, col))
         if not flips:
@@ -391,7 +388,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
     def draw_legal_targets(self) -> None:
         state = self.current_state()
-        if not self.is_live_view() or self.is_game_over(state):
+        if self.is_game_over(state):
             return
 
         dot_color = BLACK_DISK if state.current_player == BLACK else WHITE_DISK
@@ -574,7 +571,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     # Interaction
     # --------------------------------------------------------
     def try_place_disk(self, pos: Tuple[int, int]) -> None:
-        if not self.is_live_view() or self.is_game_over():
+        if self.is_game_over():
             return
 
         square = self.screen_to_square(pos)
