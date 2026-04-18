@@ -111,7 +111,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         self.flip_anim_for_index: Optional[int] = None
         self.flip_anim_cells: List[Tuple[int, int, int, int]] = []
-        self.flip_anim_start_ms: int = 0
+        self.flip_anim_accum_ms: float = 0.0
+        self.flip_anim_last_tick: int = 0
 
         self.engine_net: PolicyValueNet
         self.engine_mcts: MCTS
@@ -304,7 +305,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             line_eval = value if node.current_player == root_player else -value
             lines.append((line_actions, line_eval))
 
-        return lines
+        lines.sort(key=lambda item: item[1], reverse=True)
+        # Positive = White better; negative = Black better (independent of side to move).
+        return [
+            (actions, line_eval if root_player == ENGINE_WHITE else -line_eval)
+            for actions, line_eval in lines
+        ]
 
     def refresh_engine_hint(self) -> None:
         state = self.current_state()
@@ -372,7 +378,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                 self._vs_engine_delay_until = pygame.time.get_ticks() + 500
 
         self.flip_anim_cells = anim_cells
-        self.flip_anim_start_ms = pygame.time.get_ticks()
+        self.flip_anim_accum_ms = 0.0
+        self.flip_anim_last_tick = pygame.time.get_ticks()
         self.flip_anim_for_index = self.current_index
 
     def go_back(self) -> None:
@@ -403,6 +410,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     def _clear_flip_animation(self) -> None:
         self.flip_anim_for_index = None
         self.flip_anim_cells = []
+        self.flip_anim_accum_ms = 0.0
+        self.flip_anim_last_tick = 0
 
     def _best_engine_action(self, state: GameState) -> int:
         engine_state = self._state_to_engine(state)
@@ -588,11 +597,19 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             return None
         if self.current_index != self.flip_anim_for_index:
             return None
-        elapsed = pygame.time.get_ticks() - self.flip_anim_start_ms
-        if elapsed >= FLIP_ANIM_MS:
+        now = pygame.time.get_ticks()
+        dt_raw = now - self.flip_anim_last_tick
+        self.flip_anim_last_tick = now
+        # Hint mode runs heavy MCTS in the same frame after draw_pieces; cap dt so one
+        # long stall does not jump the flip animation to the end in a single step.
+        dt = float(min(max(dt_raw, 0), 40))
+        if dt == 0.0:
+            dt = 17.0
+        self.flip_anim_accum_ms += dt
+        if self.flip_anim_accum_ms >= FLIP_ANIM_MS:
             self._clear_flip_animation()
             return None
-        return elapsed / FLIP_ANIM_MS
+        return self.flip_anim_accum_ms / FLIP_ANIM_MS
 
     def draw_piece_animated(self, row: int, col: int, from_c: int, to_c: int, t: float) -> None:
         if from_c == EMPTY:
