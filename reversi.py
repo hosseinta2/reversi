@@ -1,4 +1,12 @@
-"""Pygame Reversi GUI with move list and navigation."""
+"""Pygame Reversi GUI with move list and navigation.
+
+Run the board with: python reversi.py
+
+Training saves to reversi_engine_weights.npz next to these files — the game loads that
+file on startup; press L in the GUI to reload after training without restarting.
+
+Self-play training: python reversi_engine.py
+"""
 
 # Pylint doesn't understand many dynamic pygame attributes/constants.
 # pylint: disable=no-member,missing-function-docstring
@@ -15,12 +23,15 @@ import pygame
 
 from reversi_engine import (
     BLACK as ENGINE_BLACK,
+    EMPTY as ENGINE_EMPTY,
     MCTS,
     PolicyValueNet,
     ReversiState,
     WHITE as ENGINE_WHITE,
     apply_action as engine_apply_action,
+    is_terminal as engine_is_terminal,
     PASS_MOVE as ENGINE_PASS_MOVE,
+    winner as engine_winner,
 )
 
 
@@ -72,6 +83,9 @@ DIRECTIONS = [
 ]
 FILES = 'abcdefgh'
 WEIGHTS_FILE = Path(__file__).with_name('reversi_engine_weights.npz')
+# Stronger search for engine moves; lighter for sidebar hints (many MCTS calls per refresh).
+ENGINE_MCTS_SIMULATIONS_PLAY = 96
+ENGINE_MCTS_SIMULATIONS_HINTS = 28
 
 
 @dataclass
@@ -116,6 +130,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         self.engine_net: PolicyValueNet
         self.engine_mcts: MCTS
+        self.engine_mcts_hints: MCTS
         self._init_engine_network()
 
         panel_x = BOARD_PIXELS
@@ -233,29 +248,42 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         return f'{FILES[col]}{row + 1}'
 
     def _init_engine_network(self) -> None:
-        """Build PolicyValueNet to match saved weights (hidden size from checkpoint)."""
+        """Load PolicyValueNet (CNN AlphaZero-style or legacy MLP) from checkpoint."""
         try:
-            data = np.load(WEIGHTS_FILE)
-            w1 = data['w1']
-            hidden_size = int(w1.shape[1])
-            self.engine_net = PolicyValueNet(
-                hidden_size=hidden_size, learning_rate=0.01, seed=42
-            )
-            self.engine_net.w1 = w1
-            self.engine_net.b1 = data['b1']
-            self.engine_net.wp = data['wp']
-            self.engine_net.bp = data['bp']
-            self.engine_net.wv = data['wv']
-            self.engine_net.bv = data['bv']
-            self.engine_mcts = MCTS(self.engine_net, simulations=96)
+            with np.load(WEIGHTS_FILE) as data:
+                self.engine_net = PolicyValueNet.from_npz(data)
+            self.engine_mcts = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_PLAY)
+            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = True
-            self.engine_status = 'Engine ready'
-        except (OSError, KeyError, ValueError):
-            self.engine_net = PolicyValueNet(hidden_size=128, learning_rate=0.01, seed=42)
+            self.engine_status = 'Engine ready — enable Hints or Vs engine'
+        except OSError as exc:
+            self.engine_net = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.01, seed=42)
             self.engine_mcts = MCTS(self.engine_net, simulations=64)
+            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = False
             self.engine_enabled = False
-            self.engine_status = f'Engine unavailable ({WEIGHTS_FILE.name} not found)'
+            if getattr(exc, 'errno', None) == 2 or isinstance(exc, FileNotFoundError):
+                self.engine_status = f'Engine unavailable (missing {WEIGHTS_FILE.name})'
+            else:
+                self.engine_status = f'Engine unavailable (could not read weights: {exc})'
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            self.engine_net = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.01, seed=42)
+            self.engine_mcts = MCTS(self.engine_net, simulations=64)
+            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
+            self.engine_ready = False
+            self.engine_enabled = False
+            msg = str(exc).replace('\n', ' ')
+            if len(msg) > 72:
+                msg = msg[:69] + '...'
+            self.engine_status = f'Engine unavailable (bad weights: {msg})'
+
+    def reload_engine_weights(self) -> None:
+        """Reload PolicyValueNet and MCTS from WEIGHTS_FILE (same file training saves)."""
+        self._init_engine_network()
+        self.engine_cache_key = None
+        self.engine_lines = []
+        if self.engine_ready:
+            self.engine_status = 'Engine ready — weights reloaded from disk'
 
     def _state_to_engine(self, state: GameState) -> ReversiState:
         board_np = np.array(state.board, dtype=np.int8)
@@ -269,7 +297,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         return self.move_to_label(row, col)
 
     def _top_actions(self, state: ReversiState, limit: int) -> List[int]:
-        policy = self.engine_mcts.run(state, temperature=1.0)
+        policy = self.engine_mcts_hints.run(state, temperature=1.0)
         actions: List[int] = []
         for action in np.argsort(policy)[::-1]:
             action_int = int(action)
@@ -281,6 +309,17 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             if len(actions) >= limit:
                 break
         return actions
+
+    def _hint_leaf_score(self, node: ReversiState, root_player: int) -> float:
+        """Prefer exact game outcome at terminals; otherwise MCTS (search propagates decisive scores)."""
+        if engine_is_terminal(node):
+            win = engine_winner(node)
+            if win == ENGINE_EMPTY:
+                return 0.0
+            return 1.0 if win == root_player else -1.0
+        # Raw policy-value net is often near 0 when undertrained; play-strength MCTS backs up ±1.
+        v = self.engine_mcts.evaluate(node)
+        return v if node.current_player == root_player else -v
 
     def _build_engine_lines(
         self, state: GameState, line_count: int = 3, depth: int = 5
@@ -301,8 +340,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                     break
                 action = next_actions[0]
 
-            _, value = self.engine_net.predict(node)
-            line_eval = value if node.current_player == root_player else -value
+            line_eval = self._hint_leaf_score(node, root_player)
             lines.append((line_actions, line_eval))
 
         lines.sort(key=lambda item: item[1], reverse=True)
@@ -707,6 +745,13 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.screen.blit(turn_surface, (panel_x, y))
         y += 26
 
+        eng_color = SUBTEXT if self.engine_ready else (220, 140, 140)
+        eng_msg = self.engine_status
+        if len(eng_msg) > 52:
+            eng_msg = eng_msg[:49] + '...'
+        self.screen.blit(self.font_small.render(eng_msg, True, eng_color), (panel_x, y))
+        y += 22
+
         if (
             self.engine_enabled
             and not self.play_vs_engine
@@ -829,7 +874,9 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             self.draw_button(self.play_vs_engine_button, 'Play vs engine', False)
             self.draw_button(self.engine_button, 'Engine unavailable', False)
 
-        help_text = self.font_small.render('Click a dot to place, R to reset', True, SUBTEXT)
+        help_text = self.font_small.render(
+            'Click a dot to place · R reset · L reload engine weights', True, SUBTEXT
+        )
         help_rect = help_text.get_rect(
             midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.play_vs_engine_button.top - 10)
         )
@@ -952,6 +999,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                         self.go_forward()
                     elif event.key == pygame.K_r:
                         self.reset_game()
+                    elif event.key == pygame.K_l:
+                        self.reload_engine_weights()
 
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_mouse_down(event.pos)
