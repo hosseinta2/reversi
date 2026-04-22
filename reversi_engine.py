@@ -477,7 +477,9 @@ class MCTS:
         add_root_noise: bool = False,
         dirichlet_alpha: float = 0.35,
         dirichlet_epsilon: float = 0.25,
+        simulations: Optional[int] = None,
     ) -> MCTSNode:
+        sims = self.simulations if simulations is None else max(1, int(simulations))
         root = MCTSNode(root_state)
         self._expand(root)
         if add_root_noise and root.children:
@@ -489,7 +491,7 @@ class MCTS:
                 self.rng,
             )
 
-        for _ in range(self.simulations):
+        for _ in range(sims):
             node = root
             path = [node]
 
@@ -505,9 +507,9 @@ class MCTS:
 
         return root
 
-    def evaluate(self, root_state: ReversiState) -> float:
+    def evaluate(self, root_state: ReversiState, simulations: Optional[int] = None) -> float:
         """Mean root value after search, from root_state.current_player's perspective ([-1, 1])."""
-        root = self._run_search(root_state, add_root_noise=False)
+        root = self._run_search(root_state, add_root_noise=False, simulations=simulations)
         return root.value
 
     def run(

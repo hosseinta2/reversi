@@ -1,11 +1,7 @@
 """Pygame Reversi GUI with move list and navigation.
 
-Run the board with: python reversi.py
-
-Training saves to reversi_engine_weights.npz next to these files — the game loads that
-file on startup; press L in the GUI to reload after training without restarting.
-
-Self-play training: python reversi_engine.py
+Run: python reversi.py · Train / save weights: python reversi_engine.py
+(weights file: reversi_engine_weights.npz next to these modules.)
 """
 
 # Pylint doesn't understand many dynamic pygame attributes/constants.
@@ -39,7 +35,7 @@ from reversi_engine import (
 # Configuration
 # ============================================================
 BOARD_PIXELS = 640
-PANEL_WIDTH = 300
+PANEL_WIDTH = 400
 WINDOW_WIDTH = BOARD_PIXELS + PANEL_WIDTH
 WINDOW_HEIGHT = BOARD_PIXELS
 BOARD_SIZE = 8
@@ -60,7 +56,7 @@ SCROLLBAR_PAD = 4
 SCROLLBAR_TRACK = (52, 54, 58)
 SCROLLBAR_THUMB = (120, 125, 135)
 SCROLLBAR_THUMB_HOVER = (150, 155, 165)
-# Cap move list height so it does not crowd help text and buttons below.
+# Cap move list height so it does not crowd buttons below.
 MOVES_LIST_MAX_HEIGHT = 168
 MOVES_LIST_BOTTOM_GAP = 32
 TEXT = (235, 235, 235)
@@ -83,9 +79,23 @@ DIRECTIONS = [
 ]
 FILES = 'abcdefgh'
 WEIGHTS_FILE = Path(__file__).with_name('reversi_engine_weights.npz')
-# Stronger search for engine moves; lighter for sidebar hints (many MCTS calls per refresh).
+# MCTS budgets (tuned for “deeper but runnable” hints on a laptop CPU):
+# - One strong eval at the root; lighter per-step policy along lines; modest line-end eval.
+# - Line ply depth grows in midgame/endgame (fewer legal moves → cheaper per ply).
 ENGINE_MCTS_SIMULATIONS_PLAY = 96
-ENGINE_MCTS_SIMULATIONS_HINTS = 28
+ENGINE_MCTS_SIMULATIONS_HINTS = 22
+ENGINE_MCTS_SIMULATIONS_EVAL_POSITION = 120
+ENGINE_MCTS_SIMULATIONS_EVAL_LINE = 56
+ENGINE_HINT_LINE_COUNT = 3
+ENGINE_HINT_LINE_DEPTH = 8
+ENGINE_HINT_LINE_DEPTH_MID = 10
+ENGINE_HINT_LINE_DEPTH_ENDGAME = 12
+ENGINE_EMPTY_MID = 38
+ENGINE_EMPTY_END = 22
+
+EVAL_BAR_HEIGHT = 22
+EVAL_BAR_BORDER = (88, 92, 98)
+EVAL_BAR_MID_TICK = (120, 125, 130)
 
 
 @dataclass
@@ -120,6 +130,8 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.engine_status = 'Engine unavailable (no trained weights)'
         self.engine_cache_key: Optional[Tuple[int, int]] = None
         self.engine_lines: List[Tuple[List[str], float]] = []
+        self.engine_position_white_eval: Optional[float] = None
+        self.engine_bar_white_eval: Optional[float] = None
         self.play_vs_engine = False
         self._vs_engine_delay_until: Optional[int] = None
 
@@ -282,6 +294,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self._init_engine_network()
         self.engine_cache_key = None
         self.engine_lines = []
+        self.engine_bar_white_eval = None
         if self.engine_ready:
             self.engine_status = 'Engine ready — weights reloaded from disk'
 
@@ -310,22 +323,48 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                 break
         return actions
 
-    def _hint_leaf_score(self, node: ReversiState, root_player: int) -> float:
-        """Prefer exact game outcome at terminals; otherwise MCTS (search propagates decisive scores)."""
+    def _mcts_value_for_white(
+        self, rstate: ReversiState, simulations: int
+    ) -> float:
+        """MCTS estimate in [-1, 1], fixed White-positive (+ favors White), any side to move."""
+        v = self.engine_mcts.evaluate(rstate, simulations=simulations)
+        return v if rstate.current_player == ENGINE_WHITE else -v
+
+    def _leaf_white_eval(self, node: ReversiState) -> float:
+        """Line-end score in White-positive frame; terminals use disk result, else MCTS."""
         if engine_is_terminal(node):
             win = engine_winner(node)
             if win == ENGINE_EMPTY:
                 return 0.0
-            return 1.0 if win == root_player else -1.0
-        # Raw policy-value net is often near 0 when undertrained; play-strength MCTS backs up ±1.
-        v = self.engine_mcts.evaluate(node)
-        return v if node.current_player == root_player else -v
+            return 1.0 if win == ENGINE_WHITE else -1.0
+        return self._mcts_value_for_white(node, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_LINE)
+
+    @staticmethod
+    def _empty_squares(state: GameState) -> int:
+        return sum(cell == EMPTY for row in state.board for cell in row)
+
+    def _hint_line_depth(self, state: GameState) -> int:
+        """More plies late game (branching shrinks); cap cost early."""
+        e = self._empty_squares(state)
+        if e <= ENGINE_EMPTY_END:
+            return ENGINE_HINT_LINE_DEPTH_ENDGAME
+        if e <= ENGINE_EMPTY_MID:
+            return ENGINE_HINT_LINE_DEPTH_MID
+        return ENGINE_HINT_LINE_DEPTH
 
     def _build_engine_lines(
-        self, state: GameState, line_count: int = 3, depth: int = 5
-    ) -> List[Tuple[List[str], float]]:
+        self,
+        state: GameState,
+        line_count: int = ENGINE_HINT_LINE_COUNT,
+        position_white: Optional[float] = None,
+    ) -> Tuple[List[Tuple[List[str], float]], float]:
         root = self._state_to_engine(state)
         root_player = root.current_player
+        depth = self._hint_line_depth(state)
+        if position_white is None:
+            position_white = self._mcts_value_for_white(
+                root, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_POSITION
+            )
         lines: List[Tuple[List[str], float]] = []
 
         for first_action in self._top_actions(root, limit=line_count):
@@ -340,15 +379,11 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                     break
                 action = next_actions[0]
 
-            line_eval = self._hint_leaf_score(node, root_player)
-            lines.append((line_actions, line_eval))
+            lines.append((line_actions, self._leaf_white_eval(node)))
 
-        lines.sort(key=lambda item: item[1], reverse=True)
-        # Positive = White better; negative = Black better (independent of side to move).
-        return [
-            (actions, line_eval if root_player == ENGINE_WHITE else -line_eval)
-            for actions, line_eval in lines
-        ]
+        # Best line for side to move: maximize White score if White moves, minimize if Black moves.
+        lines.sort(key=lambda item: item[1], reverse=(root_player == ENGINE_WHITE))
+        return lines, position_white
 
     def refresh_engine_hint(self) -> None:
         state = self.current_state()
@@ -358,13 +393,32 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         self.engine_cache_key = cache_key
         self.engine_lines = []
+        self.engine_position_white_eval = None
+        self.engine_bar_white_eval = None
 
-        if (
-            not self.engine_enabled
-            or self.play_vs_engine
-            or not self.engine_ready
-            or self.is_game_over(state)
-        ):
+        if not self.engine_ready:
+            return
+
+        if self.is_game_over(state):
+            black_count, white_count = self.counts(state.board)
+            if white_count > black_count:
+                end_ev = 1.0
+            elif black_count > white_count:
+                end_ev = -1.0
+            else:
+                end_ev = 0.0
+            self.engine_position_white_eval = end_ev
+            self.engine_bar_white_eval = end_ev
+            return
+
+        root = self._state_to_engine(state)
+        position_white = self._mcts_value_for_white(
+            root, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_POSITION
+        )
+        self.engine_position_white_eval = position_white
+        self.engine_bar_white_eval = position_white
+
+        if not self.engine_enabled or self.play_vs_engine:
             return
 
         legal_moves = self.valid_moves(state.board, state.current_player)
@@ -372,7 +426,9 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             self.engine_status = 'Engine: pass'
             return
 
-        self.engine_lines = self._build_engine_lines(state, line_count=3, depth=5)
+        self.engine_lines, _ = self._build_engine_lines(state, position_white=position_white)
+        if self.engine_lines:
+            self.engine_bar_white_eval = self.engine_lines[0][1]
 
     def push_state(self, board: List[List[int]], current_player: int, move_label: str) -> None:
         if not self.is_live_view():
@@ -701,6 +757,39 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         txt = self.font_body.render(label, True, (255, 255, 255))
         self.screen.blit(txt, txt.get_rect(center=rect.center))
 
+    def _draw_evaluation_bar(self, panel_x: int, y: int) -> int:
+        """Black left, white right; 0.0 → half/half; + favors White (more white). Returns next y."""
+        if self.engine_bar_white_eval is None:
+            return y
+        bar_w = PANEL_WIDTH - 32
+        caption = self.font_small.render('Best move (White +)', True, SUBTEXT)
+        self.screen.blit(caption, (panel_x, y))
+        y += 18
+
+        ev = float(self.engine_bar_white_eval)
+        ev_c = max(-1.0, min(1.0, ev))
+        white_frac = (ev_c + 1.0) * 0.5
+        black_frac = 1.0 - white_frac
+        split_x = panel_x + int(round(bar_w * black_frac))
+        split_x = min(panel_x + bar_w, max(panel_x, split_x))
+        bar_h = EVAL_BAR_HEIGHT
+
+        if split_x > panel_x:
+            pygame.draw.rect(self.screen, BLACK_DISK, (panel_x, y, split_x - panel_x, bar_h))
+        if split_x < panel_x + bar_w:
+            pygame.draw.rect(
+                self.screen, WHITE_DISK, (split_x, y, panel_x + bar_w - split_x, bar_h)
+            )
+        pygame.draw.rect(
+            self.screen, EVAL_BAR_BORDER, (panel_x, y, bar_w, bar_h), width=1, border_radius=4
+        )
+        mid_x = panel_x + bar_w // 2
+        pygame.draw.line(self.screen, EVAL_BAR_MID_TICK, (mid_x, y), (mid_x, y + bar_h), 1)
+
+        y += bar_h + 4
+        self.screen.blit(self.font_small.render(f'{ev:+.3f}', True, TEXT), (panel_x, y))
+        return y + 20
+
     def draw_side_panel(self) -> None:  # pylint: disable=too-many-locals,too-many-statements
         state = self.current_state()
         self.refresh_engine_hint()
@@ -747,10 +836,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         eng_color = SUBTEXT if self.engine_ready else (220, 140, 140)
         eng_msg = self.engine_status
-        if len(eng_msg) > 52:
-            eng_msg = eng_msg[:49] + '...'
+        if len(eng_msg) > 70:
+            eng_msg = eng_msg[:67] + '...'
         self.screen.blit(self.font_small.render(eng_msg, True, eng_color), (panel_x, y))
         y += 22
+
+        y = self._draw_evaluation_bar(panel_x, y)
 
         if (
             self.engine_enabled
@@ -758,6 +849,13 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             and self.engine_ready
             and not self.is_game_over(state)
         ):
+            if self.engine_position_white_eval is not None:
+                ev_txt = (
+                    f'Position (White +): {self.engine_position_white_eval:+.3f} · '
+                    'lines = end of variation'
+                )
+                self.screen.blit(self.font_small.render(ev_txt, True, SUBTEXT), (panel_x, y))
+                y += 20
             if not self.engine_lines:
                 self.screen.blit(self.font_small.render('Lines: pass', True, TEXT), (panel_x, y))
                 y += 20
@@ -873,14 +971,6 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         else:
             self.draw_button(self.play_vs_engine_button, 'Play vs engine', False)
             self.draw_button(self.engine_button, 'Engine unavailable', False)
-
-        help_text = self.font_small.render(
-            'Click a dot to place · R reset · L reload engine weights', True, SUBTEXT
-        )
-        help_rect = help_text.get_rect(
-            midbottom=(BOARD_PIXELS + PANEL_WIDTH // 2, self.play_vs_engine_button.top - 10)
-        )
-        self.screen.blit(help_text, help_rect)
 
     # --------------------------------------------------------
     # Interaction
