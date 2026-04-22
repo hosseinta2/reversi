@@ -96,6 +96,8 @@ ENGINE_EMPTY_END = 22
 EVAL_BAR_HEIGHT = 22
 EVAL_BAR_BORDER = (88, 92, 98)
 EVAL_BAR_MID_TICK = (120, 125, 130)
+# Exponential smoothing toward new MCTS values (higher = snappier, frame-rate independent).
+EVAL_BAR_SMOOTH_SPEED = 7.5
 
 
 @dataclass
@@ -127,11 +129,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.selected_square: Optional[Tuple[int, int]] = None
         self.engine_enabled = False
         self.engine_ready = False
-        self.engine_status = 'Engine unavailable (no trained weights)'
+        self.engine_status = ''
         self.engine_cache_key: Optional[Tuple[int, int]] = None
         self.engine_lines: List[Tuple[List[str], float]] = []
         self.engine_position_white_eval: Optional[float] = None
         self.engine_bar_white_eval: Optional[float] = None
+        self._engine_bar_display_eval: Optional[float] = None
         self.play_vs_engine = False
         self._vs_engine_delay_until: Optional[int] = None
 
@@ -267,7 +270,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             self.engine_mcts = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_PLAY)
             self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = True
-            self.engine_status = 'Engine ready — enable Hints or Vs engine'
+            self.engine_status = ''
         except OSError as exc:
             self.engine_net = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.01, seed=42)
             self.engine_mcts = MCTS(self.engine_net, simulations=64)
@@ -295,8 +298,9 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.engine_cache_key = None
         self.engine_lines = []
         self.engine_bar_white_eval = None
+        self._engine_bar_display_eval = None
         if self.engine_ready:
-            self.engine_status = 'Engine ready — weights reloaded from disk'
+            self.engine_status = ''
 
     def _state_to_engine(self, state: GameState) -> ReversiState:
         board_np = np.array(state.board, dtype=np.int8)
@@ -423,7 +427,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
         legal_moves = self.valid_moves(state.board, state.current_player)
         if not legal_moves:
-            self.engine_status = 'Engine: pass'
+            self.engine_status = 'Pass'
             return
 
         self.engine_lines, _ = self._build_engine_lines(state, position_white=position_white)
@@ -495,6 +499,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.current_index = 0
         self.selected_square = None
         self.engine_cache_key = None
+        self._engine_bar_display_eval = None
         self.play_vs_engine = False
         self.moves_scroll = 0
         self.moves_scroll_dragging = False
@@ -757,16 +762,30 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         txt = self.font_body.render(label, True, (255, 255, 255))
         self.screen.blit(txt, txt.get_rect(center=rect.center))
 
+    def _update_engine_bar_smooth(self, dt_ms: int) -> None:
+        """Ease displayed bar value toward engine_bar_white_eval (frame-delta based)."""
+        target = self.engine_bar_white_eval
+        if target is None:
+            self._engine_bar_display_eval = None
+            return
+        t = float(target)
+        if self._engine_bar_display_eval is None:
+            self._engine_bar_display_eval = t
+            return
+        d = t - self._engine_bar_display_eval
+        if abs(d) < 1.5e-4:
+            self._engine_bar_display_eval = t
+            return
+        dt = max(0.0, min(float(dt_ms) / 1000.0, 0.25))
+        k = 1.0 - math.exp(-EVAL_BAR_SMOOTH_SPEED * dt)
+        self._engine_bar_display_eval += d * k
+
     def _draw_evaluation_bar(self, panel_x: int, y: int) -> int:
         """Black left, white right; 0.0 → half/half; + favors White (more white). Returns next y."""
-        if self.engine_bar_white_eval is None:
+        if self._engine_bar_display_eval is None:
             return y
         bar_w = PANEL_WIDTH - 32
-        caption = self.font_small.render('Best move (White +)', True, SUBTEXT)
-        self.screen.blit(caption, (panel_x, y))
-        y += 18
-
-        ev = float(self.engine_bar_white_eval)
+        ev = float(self._engine_bar_display_eval)
         ev_c = max(-1.0, min(1.0, ev))
         white_frac = (ev_c + 1.0) * 0.5
         black_frac = 1.0 - white_frac
@@ -793,6 +812,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
     def draw_side_panel(self) -> None:  # pylint: disable=too-many-locals,too-many-statements
         state = self.current_state()
         self.refresh_engine_hint()
+        self._update_engine_bar_smooth(self.clock.get_time())
         panel_rect = pygame.Rect(BOARD_PIXELS, 0, PANEL_WIDTH, WINDOW_HEIGHT)
         pygame.draw.rect(self.screen, PANEL_BG, panel_rect)
         pygame.draw.line(
@@ -834,12 +854,13 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.screen.blit(turn_surface, (panel_x, y))
         y += 26
 
-        eng_color = SUBTEXT if self.engine_ready else (220, 140, 140)
-        eng_msg = self.engine_status
-        if len(eng_msg) > 70:
-            eng_msg = eng_msg[:67] + '...'
-        self.screen.blit(self.font_small.render(eng_msg, True, eng_color), (panel_x, y))
-        y += 22
+        eng_msg = self.engine_status.strip()
+        if eng_msg:
+            eng_color = SUBTEXT if self.engine_ready else (220, 140, 140)
+            if len(eng_msg) > 70:
+                eng_msg = eng_msg[:67] + '...'
+            self.screen.blit(self.font_small.render(eng_msg, True, eng_color), (panel_x, y))
+            y += 22
 
         y = self._draw_evaluation_bar(panel_x, y)
 
@@ -849,13 +870,6 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             and self.engine_ready
             and not self.is_game_over(state)
         ):
-            if self.engine_position_white_eval is not None:
-                ev_txt = (
-                    f'Position (White +): {self.engine_position_white_eval:+.3f} · '
-                    'lines = end of variation'
-                )
-                self.screen.blit(self.font_small.render(ev_txt, True, SUBTEXT), (panel_x, y))
-                y += 20
             if not self.engine_lines:
                 self.screen.blit(self.font_small.render('Lines: pass', True, TEXT), (panel_x, y))
                 y += 20
@@ -868,11 +882,6 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             y += 8
         else:
             y += 8
-
-        if self.play_vs_engine and self.engine_ready and not self.is_game_over(state):
-            vs_txt = self.font_small.render('You: Black · Engine: White', True, SUBTEXT)
-            self.screen.blit(vs_txt, (panel_x, y))
-            y += 22
 
         pygame.draw.line(
             self.screen,
