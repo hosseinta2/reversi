@@ -20,6 +20,10 @@ DIRECTIONS = [
     (1, -1),  (1, 0),  (1, 1),
 ]
 
+# AlphaZero-style self-play: tree depth grows with simulations (no artificial ply cap).
+# Higher values = deeper MCTS per position; training runs slower but produces stronger targets.
+SELFPLAY_MCTS_SIMULATIONS_DEFAULT = 128
+
 
 @dataclass(frozen=True)
 class ReversiState:
@@ -546,7 +550,12 @@ class MCTS:
 class SelfPlayTrainer:
     """AlphaZero loop: MCTS self-play (root Dirichlet + visit policy) then SGD on (s, π, z)."""
 
-    def __init__(self, net: PolicyValueNet, simulations: int = 48, seed: int = 0) -> None:
+    def __init__(
+        self,
+        net: PolicyValueNet,
+        simulations: int = SELFPLAY_MCTS_SIMULATIONS_DEFAULT,
+        seed: int = 0,
+    ) -> None:
         self.net = net
         self.mcts = MCTS(net, simulations=simulations)
         self.mcts.rng = np.random.default_rng(seed)
@@ -657,16 +666,20 @@ if __name__ == "__main__":
         "To play: python reversi.py ===\n",
         flush=True,
     )
-    # CNN + PUCT MCTS self-play. Defaults favor CPU/laptop runs (fewer sims, smaller net,
-    # fewer games per round). Raise simulations / conv_channels / iterations for stronger play.
-    network = PolicyValueNet(arch='cnn', conv_channels=32, learning_rate=0.003, seed=42)
-    trainer = SelfPlayTrainer(network, simulations=48, seed=42)
+    # CNN + PUCT MCTS self-play (AlphaZero-style). Deeper search via more simulations per move;
+    # slightly wider CNN and more self-play games per iteration than the old laptop defaults.
+    network = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.003, seed=42)
+    trainer = SelfPlayTrainer(
+        network,
+        simulations=SELFPLAY_MCTS_SIMULATIONS_DEFAULT,
+        seed=42,
+    )
     trainer.train(
-        iterations=10,
-        games_per_iteration=4,
+        iterations=14,
+        games_per_iteration=6,
         batch_size=64,
         lr_decay=0.988,
-        max_replay_samples=50_000,
+        max_replay_samples=80_000,
         epochs_per_iteration=1,
     )
     weights_file = Path(__file__).with_name('reversi_engine_weights.npz')
