@@ -20,7 +20,6 @@ import pygame
 from reversi_engine import (
     BLACK as ENGINE_BLACK,
     EMPTY as ENGINE_EMPTY,
-    MCTS,
     PolicyValueNet,
     ReversiState,
     WHITE as ENGINE_WHITE,
@@ -79,13 +78,9 @@ DIRECTIONS = [
 ]
 FILES = 'abcdefgh'
 WEIGHTS_FILE = Path(__file__).with_name('reversi_engine_weights.npz')
-# MCTS budgets (tuned for “deeper but runnable” hints on a laptop CPU):
-# - One strong eval at the root; lighter per-step policy along lines; modest line-end eval.
-# - Line ply depth grows in midgame/endgame (fewer legal moves → cheaper per ply).
-ENGINE_MCTS_SIMULATIONS_PLAY = 96
-ENGINE_MCTS_SIMULATIONS_HINTS = 22
-ENGINE_MCTS_SIMULATIONS_EVAL_POSITION = 120
-ENGINE_MCTS_SIMULATIONS_EVAL_LINE = 56
+# NN-only engine knobs.
+ENGINE_POLICY_TEMPERATURE_HINTS = 1.0
+ENGINE_POLICY_TEMPERATURE_PLAY = 0.0
 ENGINE_HINT_LINE_COUNT = 3
 ENGINE_HINT_LINE_DEPTH = 8
 ENGINE_HINT_LINE_DEPTH_MID = 10
@@ -96,7 +91,7 @@ ENGINE_EMPTY_END = 22
 EVAL_BAR_HEIGHT = 22
 EVAL_BAR_BORDER = (88, 92, 98)
 EVAL_BAR_MID_TICK = (120, 125, 130)
-# Exponential smoothing toward new MCTS values (higher = snappier, frame-rate independent).
+# Exponential smoothing toward new NN values (higher = snappier, frame-rate independent).
 EVAL_BAR_SMOOTH_SPEED = 7.5
 
 
@@ -144,8 +139,6 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         self.flip_anim_last_tick: int = 0
 
         self.engine_net: PolicyValueNet
-        self.engine_mcts: MCTS
-        self.engine_mcts_hints: MCTS
         self._init_engine_network()
 
         panel_x = BOARD_PIXELS
@@ -263,18 +256,14 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         return f'{FILES[col]}{row + 1}'
 
     def _init_engine_network(self) -> None:
-        """Load PolicyValueNet (CNN AlphaZero-style or legacy MLP) from checkpoint."""
+        """Load policy-value NN from checkpoint (NN-only engine, no MCTS)."""
         try:
             with np.load(WEIGHTS_FILE) as data:
                 self.engine_net = PolicyValueNet.from_npz(data)
-            self.engine_mcts = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_PLAY)
-            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = True
             self.engine_status = ''
         except OSError as exc:
             self.engine_net = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.01, seed=42)
-            self.engine_mcts = MCTS(self.engine_net, simulations=64)
-            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = False
             self.engine_enabled = False
             if getattr(exc, 'errno', None) == 2 or isinstance(exc, FileNotFoundError):
@@ -283,8 +272,6 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                 self.engine_status = f'Engine unavailable (could not read weights: {exc})'
         except Exception as exc:  # pylint: disable=broad-exception-caught
             self.engine_net = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.01, seed=42)
-            self.engine_mcts = MCTS(self.engine_net, simulations=64)
-            self.engine_mcts_hints = MCTS(self.engine_net, simulations=ENGINE_MCTS_SIMULATIONS_HINTS)
             self.engine_ready = False
             self.engine_enabled = False
             msg = str(exc).replace('\n', ' ')
@@ -293,7 +280,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             self.engine_status = f'Engine unavailable (bad weights: {msg})'
 
     def reload_engine_weights(self) -> None:
-        """Reload PolicyValueNet and MCTS from WEIGHTS_FILE (same file training saves)."""
+        """Reload policy-value NN from WEIGHTS_FILE (same file training saves)."""
         self._init_engine_network()
         self.engine_cache_key = None
         self.engine_lines = []
@@ -314,7 +301,10 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         return self.move_to_label(row, col)
 
     def _top_actions(self, state: ReversiState, limit: int) -> List[int]:
-        policy = self.engine_mcts_hints.run(state, temperature=1.0)
+        policy, _ = self.engine_net.predict(state)
+        if ENGINE_POLICY_TEMPERATURE_HINTS > 1e-6 and abs(ENGINE_POLICY_TEMPERATURE_HINTS - 1.0) > 1e-6:
+            policy = policy ** (1.0 / ENGINE_POLICY_TEMPERATURE_HINTS)
+            policy = policy / max(1e-8, float(np.sum(policy)))
         actions: List[int] = []
         for action in np.argsort(policy)[::-1]:
             action_int = int(action)
@@ -327,21 +317,19 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
                 break
         return actions
 
-    def _mcts_value_for_white(
-        self, rstate: ReversiState, simulations: int
-    ) -> float:
-        """MCTS estimate in [-1, 1], fixed White-positive (+ favors White), any side to move."""
-        v = self.engine_mcts.evaluate(rstate, simulations=simulations)
+    def _net_value_for_white(self, rstate: ReversiState) -> float:
+        """NN value in [-1, 1], fixed White-positive (+ favors White), any side to move."""
+        _policy, v = self.engine_net.predict(rstate)
         return v if rstate.current_player == ENGINE_WHITE else -v
 
     def _leaf_white_eval(self, node: ReversiState) -> float:
-        """Line-end score in White-positive frame; terminals use disk result, else MCTS."""
+        """Line-end score in White-positive frame; terminals use disk result, else NN value."""
         if engine_is_terminal(node):
             win = engine_winner(node)
             if win == ENGINE_EMPTY:
                 return 0.0
             return 1.0 if win == ENGINE_WHITE else -1.0
-        return self._mcts_value_for_white(node, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_LINE)
+        return self._net_value_for_white(node)
 
     @staticmethod
     def _empty_squares(state: GameState) -> int:
@@ -366,9 +354,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         root_player = root.current_player
         depth = self._hint_line_depth(state)
         if position_white is None:
-            position_white = self._mcts_value_for_white(
-                root, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_POSITION
-            )
+            position_white = self._net_value_for_white(root)
         lines: List[Tuple[List[str], float]] = []
 
         for first_action in self._top_actions(root, limit=line_count):
@@ -416,9 +402,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
             return
 
         root = self._state_to_engine(state)
-        position_white = self._mcts_value_for_white(
-            root, simulations=ENGINE_MCTS_SIMULATIONS_EVAL_POSITION
-        )
+        position_white = self._net_value_for_white(root)
         self.engine_position_white_eval = position_white
         self.engine_bar_white_eval = position_white
 
@@ -514,8 +498,12 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
 
     def _best_engine_action(self, state: GameState) -> int:
         engine_state = self._state_to_engine(state)
-        policy = self.engine_mcts.run(engine_state, temperature=0.0)
-        return int(np.argmax(policy))
+        policy, _ = self.engine_net.predict(engine_state)
+        if ENGINE_POLICY_TEMPERATURE_PLAY <= 1e-6:
+            return int(np.argmax(policy))
+        scaled = policy ** (1.0 / ENGINE_POLICY_TEMPERATURE_PLAY)
+        scaled = scaled / max(1e-8, float(np.sum(scaled)))
+        return int(np.random.choice(np.arange(len(scaled)), p=scaled))
 
     def play_engine_turn(self) -> None:
         """Play one move for White when in vs-engine mode (human is Black)."""
@@ -699,7 +687,7 @@ class ReversiGUI:  # pylint: disable=too-many-instance-attributes,too-many-publi
         now = pygame.time.get_ticks()
         dt_raw = now - self.flip_anim_last_tick
         self.flip_anim_last_tick = now
-        # Hint mode runs heavy MCTS in the same frame after draw_pieces; cap dt so one
+        # Hint mode can be compute-heavy in the same frame after draw_pieces; cap dt so one
         # long stall does not jump the flip animation to the end in a single step.
         dt = float(min(max(dt_raw, 0), 40))
         if dt == 0.0:

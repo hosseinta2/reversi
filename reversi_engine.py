@@ -1,4 +1,4 @@
-"""Neural-network + MCTS Reversi engine with self-play training."""
+"""Neural-network Reversi engine with NN-only self-play training."""
 
 from __future__ import annotations
 
@@ -20,9 +20,7 @@ DIRECTIONS = [
     (1, -1),  (1, 0),  (1, 1),
 ]
 
-# AlphaZero-style self-play: tree depth grows with simulations (no artificial ply cap).
-# Higher values = deeper MCTS per position; training runs slower but produces stronger targets.
-SELFPLAY_MCTS_SIMULATIONS_DEFAULT = 128
+SELFPLAY_EXPLORATION_EPS = 0.20
 
 
 @dataclass(frozen=True)
@@ -206,8 +204,13 @@ class PolicyValueNet:
         elif arch == 'cnn':
             self.conv_c = conv_channels
             c = conv_channels
-            self.w_conv = rng.normal(0.0, 0.05, size=(c, 3, 3, 3)).astype(np.float32)
-            self.b_conv = np.zeros(c, dtype=np.float32)
+            # Deep-ish CNN trunk: 3x conv(3x3)-ReLU before policy/value heads.
+            self.w_conv1 = rng.normal(0.0, 0.05, size=(c, 3, 3, 3)).astype(np.float32)
+            self.b_conv1 = np.zeros(c, dtype=np.float32)
+            self.w_conv2 = rng.normal(0.0, 0.05, size=(c, c, 3, 3)).astype(np.float32)
+            self.b_conv2 = np.zeros(c, dtype=np.float32)
+            self.w_conv3 = rng.normal(0.0, 0.05, size=(c, c, 3, 3)).astype(np.float32)
+            self.b_conv3 = np.zeros(c, dtype=np.float32)
             self.w_pol = rng.normal(0.0, 0.05, size=(c, ACTION_SIZE)).astype(np.float32)
             self.b_pol = np.zeros(ACTION_SIZE, dtype=np.float32)
             self.w_val = rng.normal(0.0, 0.05, size=(c, 1)).astype(np.float32)
@@ -225,16 +228,26 @@ class PolicyValueNet:
             value = np.tanh((h @ self.wv + self.bv).squeeze(-1))
             return logits, value
         x = self._planes_batch(states_flat)
-        conv_pre, regions = _conv2d_forward(x, self.w_conv, self.b_conv, pad=1)
-        self._last_conv_regions = regions
-        self._last_conv_pre = conv_pre
-        h_relu = np.maximum(conv_pre, 0.0)
-        gap = np.mean(h_relu, axis=(2, 3))
+        pre1, reg1 = _conv2d_forward(x, self.w_conv1, self.b_conv1, pad=1)
+        h1 = np.maximum(pre1, 0.0)
+        pre2, reg2 = _conv2d_forward(h1, self.w_conv2, self.b_conv2, pad=1)
+        h2 = np.maximum(pre2, 0.0)
+        pre3, reg3 = _conv2d_forward(h2, self.w_conv3, self.b_conv3, pad=1)
+        h3 = np.maximum(pre3, 0.0)
+        gap = np.mean(h3, axis=(2, 3))
         logits = gap @ self.w_pol + self.b_pol
         value_pre = (gap @ self.w_val + self.b_val).squeeze(-1)
         value = np.tanh(value_pre)
+        self._last_pre1 = pre1
+        self._last_pre2 = pre2
+        self._last_pre3 = pre3
+        self._last_reg1 = reg1
+        self._last_reg2 = reg2
+        self._last_reg3 = reg3
+        self._last_h1 = h1
+        self._last_h2 = h2
+        self._last_h3 = h3
         self._last_gap = gap
-        self._last_h_relu = h_relu
         self._last_value_pre = value_pre
         self._last_x = x
         return logits, value
@@ -252,10 +265,11 @@ class PolicyValueNet:
         target_policy: np.ndarray,
         target_value: np.ndarray,
         valid_mask: np.ndarray,
+        policy_weight: Optional[np.ndarray] = None,
     ) -> float:
         if self.arch == 'mlp':
-            return self._train_batch_mlp(states, target_policy, target_value, valid_mask)
-        return self._train_batch_cnn(states, target_policy, target_value, valid_mask)
+            return self._train_batch_mlp(states, target_policy, target_value, valid_mask, policy_weight)
+        return self._train_batch_cnn(states, target_policy, target_value, valid_mask, policy_weight)
 
     def _train_batch_mlp(
         self,
@@ -263,17 +277,19 @@ class PolicyValueNet:
         target_policy: np.ndarray,
         target_value: np.ndarray,
         valid_mask: np.ndarray,
+        policy_weight: Optional[np.ndarray] = None,
     ) -> float:
         logits, values = self.forward(states)
         probs = _softmax_masked(logits, valid_mask)
 
         batch_size = states.shape[0]
         eps = 1e-8
-        policy_loss = -np.sum(target_policy * np.log(probs + eps)) / batch_size
+        sample_w = np.ones(batch_size, dtype=np.float32) if policy_weight is None else policy_weight.astype(np.float32)
+        policy_loss = -np.sum(sample_w[:, None] * target_policy * np.log(probs + eps)) / batch_size
         value_loss = np.mean((values - target_value) ** 2)
         loss = policy_loss + value_loss
 
-        grad_logits = (probs - target_policy) / batch_size
+        grad_logits = (probs - target_policy) * sample_w[:, None] / batch_size
         grad_logits *= valid_mask
 
         grad_value = 2.0 * (values - target_value) / batch_size
@@ -307,50 +323,67 @@ class PolicyValueNet:
         target_policy: np.ndarray,
         target_value: np.ndarray,
         valid_mask: np.ndarray,
+        policy_weight: Optional[np.ndarray] = None,
     ) -> float:
         logits, values = self.forward(states)
         probs = _softmax_masked(logits, valid_mask)
 
         batch_size = states.shape[0]
         eps = 1e-8
-        policy_loss = -np.sum(target_policy * np.log(probs + eps)) / batch_size
+        sample_w = np.ones(batch_size, dtype=np.float32) if policy_weight is None else policy_weight.astype(np.float32)
+        policy_loss = -np.sum(sample_w[:, None] * target_policy * np.log(probs + eps)) / batch_size
         value_loss = np.mean((values - target_value) ** 2)
         loss = policy_loss + value_loss
 
-        grad_logits = (probs - target_policy) / batch_size
+        grad_logits = (probs - target_policy) * sample_w[:, None] / batch_size
         grad_logits *= valid_mask
 
         grad_value = 2.0 * (values - target_value) / batch_size
         grad_value *= 1.0 - values**2
 
         gap = self._last_gap
-        h_relu = self._last_h_relu
-        conv_pre = self._last_conv_pre
-        regions = self._last_conv_regions
+        h1 = self._last_h1
+        h2 = self._last_h2
+        pre1 = self._last_pre1
+        pre2 = self._last_pre2
+        pre3 = self._last_pre3
+        reg1 = self._last_reg1
+        reg2 = self._last_reg2
+        reg3 = self._last_reg3
         x = self._last_x
-        value_pre = self._last_value_pre
 
         d_gap = grad_logits @ self.w_pol.T + grad_value[:, None] @ self.w_val.T
         hw = BOARD_SIZE * BOARD_SIZE
-        d_h = d_gap[:, :, None, None] / float(hw)
-
-        d_conv_pre = d_h * (conv_pre > 0).astype(np.float32)
+        d_h3 = d_gap[:, :, None, None] / float(hw)
+        d_pre3 = d_h3 * (pre3 > 0).astype(np.float32)
 
         grad_w_pol = gap.T @ grad_logits
         grad_b_pol = np.sum(grad_logits, axis=0)
         grad_w_val = gap.T @ grad_value[:, None]
         grad_b_val = np.sum(grad_value)
 
-        dw_conv, db_conv, _dx = _conv2d_backward(
-            d_conv_pre, self.w_conv, regions, x.shape, pad=1
+        dw3, db3, dx3 = _conv2d_backward(
+            d_pre3, self.w_conv3, reg3, h2.shape, pad=1
+        )
+        d_pre2 = dx3 * (pre2 > 0).astype(np.float32)
+        dw2, db2, dx2 = _conv2d_backward(
+            d_pre2, self.w_conv2, reg2, h1.shape, pad=1
+        )
+        d_pre1 = dx2 * (pre1 > 0).astype(np.float32)
+        dw1, db1, _dx1 = _conv2d_backward(
+            d_pre1, self.w_conv1, reg1, x.shape, pad=1
         )
 
         self.w_pol -= self.lr * grad_w_pol
         self.b_pol -= self.lr * grad_b_pol
         self.w_val -= self.lr * grad_w_val
         self.b_val -= self.lr * np.array([grad_b_val], dtype=np.float32)
-        self.w_conv -= self.lr * dw_conv
-        self.b_conv -= self.lr * db_conv
+        self.w_conv3 -= self.lr * dw3
+        self.b_conv3 -= self.lr * db3
+        self.w_conv2 -= self.lr * dw2
+        self.b_conv2 -= self.lr * db2
+        self.w_conv1 -= self.lr * dw1
+        self.b_conv1 -= self.lr * db1
 
         return float(loss)
 
@@ -367,8 +400,12 @@ class PolicyValueNet:
             }
         return {
             'arch': np.array('cnn'),
-            'w_conv': self.w_conv,
-            'b_conv': self.b_conv,
+            'w_conv1': self.w_conv1,
+            'b_conv1': self.b_conv1,
+            'w_conv2': self.w_conv2,
+            'b_conv2': self.b_conv2,
+            'w_conv3': self.w_conv3,
+            'b_conv3': self.b_conv3,
             'w_pol': self.w_pol,
             'b_pol': self.b_pol,
             'w_val': self.w_val,
@@ -378,12 +415,35 @@ class PolicyValueNet:
     @classmethod
     def from_npz(cls, data: Any) -> PolicyValueNet:
         arch = str(data['arch'].item()) if 'arch' in data.files else ''
-        if arch == 'cnn' or 'w_conv' in data.files:
+        if arch == 'cnn' or 'w_conv1' in data.files or 'w_conv' in data.files:
+            if 'w_conv1' in data.files:
+                w_conv1 = np.asarray(data['w_conv1'], dtype=np.float32)
+                c = int(w_conv1.shape[0])
+                net = cls(arch='cnn', conv_channels=c, learning_rate=3e-3, seed=0)
+                net.w_conv1 = w_conv1
+                net.b_conv1 = np.asarray(data['b_conv1'], dtype=np.float32)
+                net.w_conv2 = np.asarray(data['w_conv2'], dtype=np.float32)
+                net.b_conv2 = np.asarray(data['b_conv2'], dtype=np.float32)
+                net.w_conv3 = np.asarray(data['w_conv3'], dtype=np.float32)
+                net.b_conv3 = np.asarray(data['b_conv3'], dtype=np.float32)
+                net.w_pol = np.asarray(data['w_pol'], dtype=np.float32)
+                net.b_pol = np.asarray(data['b_pol'], dtype=np.float32)
+                net.w_val = np.asarray(data['w_val'], dtype=np.float32)
+                net.b_val = np.asarray(data['b_val'], dtype=np.float32)
+                return net
+            # Backward compatibility with older single-conv checkpoints.
             w_conv = np.asarray(data['w_conv'], dtype=np.float32)
             c = int(w_conv.shape[0])
             net = cls(arch='cnn', conv_channels=c, learning_rate=3e-3, seed=0)
-            net.w_conv = w_conv
-            net.b_conv = np.asarray(data['b_conv'], dtype=np.float32)
+            net.w_conv1 = w_conv
+            net.b_conv1 = np.asarray(data['b_conv'], dtype=np.float32)
+            eye_k = np.zeros((c, c, 3, 3), dtype=np.float32)
+            for i in range(c):
+                eye_k[i, i, 1, 1] = 1.0
+            net.w_conv2 = eye_k.copy()
+            net.b_conv2 = np.zeros(c, dtype=np.float32)
+            net.w_conv3 = eye_k.copy()
+            net.b_conv3 = np.zeros(c, dtype=np.float32)
             net.w_pol = np.asarray(data['w_pol'], dtype=np.float32)
             net.b_pol = np.asarray(data['b_pol'], dtype=np.float32)
             net.w_val = np.asarray(data['w_val'], dtype=np.float32)
@@ -548,43 +608,48 @@ class MCTS:
 
 
 class SelfPlayTrainer:
-    """AlphaZero loop: MCTS self-play (root Dirichlet + visit policy) then SGD on (s, π, z)."""
+    """NN-only self-play: sample actions from policy head, train policy/value from game outcomes."""
 
     def __init__(
         self,
         net: PolicyValueNet,
-        simulations: int = SELFPLAY_MCTS_SIMULATIONS_DEFAULT,
+        exploration_eps: float = SELFPLAY_EXPLORATION_EPS,
         seed: int = 0,
     ) -> None:
         self.net = net
-        self.mcts = MCTS(net, simulations=simulations)
-        self.mcts.rng = np.random.default_rng(seed)
+        self.exploration_eps = float(np.clip(exploration_eps, 0.0, 1.0))
+        self.rng = np.random.default_rng(seed)
 
-    def self_play_game(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def self_play_game(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         state = initial_state()
         game_states: List[np.ndarray] = []
         game_masks: List[np.ndarray] = []
-        game_policies: List[np.ndarray] = []
+        game_actions_onehot: List[np.ndarray] = []
         players: List[int] = []
 
         move_index = 0
         while not is_terminal(state):
-            # AlphaZero-style: high temperature for opening, anneal later; root noise only in self-play.
-            temperature = 1.0 if move_index < 24 else (0.25 if move_index < 48 else 1e-6)
-            policy = self.mcts.run(
-                state,
-                temperature=temperature,
-                add_root_noise=True,
-                dirichlet_alpha=0.35,
-                dirichlet_epsilon=0.25,
-            )
+            # Opening exploration then sharper play later.
+            temperature = 1.15 if move_index < 18 else (0.75 if move_index < 44 else 0.20)
+            policy, _value = self.net.predict(state)
+            if self.exploration_eps > 0:
+                mask = valid_action_mask(state)
+                legal = np.where(mask > 0)[0]
+                if len(legal) > 0:
+                    explore = np.zeros_like(policy)
+                    explore[legal] = 1.0 / len(legal)
+                    policy = (1.0 - self.exploration_eps) * policy + self.exploration_eps * explore
 
             game_states.append(encode_state(state))
             game_masks.append(valid_action_mask(state))
-            game_policies.append(policy)
             players.append(state.current_player)
 
-            action = int(np.random.choice(np.arange(ACTION_SIZE), p=policy))
+            scaled = np.power(np.maximum(policy, 1e-10), 1.0 / max(temperature, 1e-3))
+            scaled /= np.sum(scaled)
+            action = int(self.rng.choice(np.arange(ACTION_SIZE), p=scaled))
+            action_onehot = np.zeros(ACTION_SIZE, dtype=np.float32)
+            action_onehot[action] = 1.0
+            game_actions_onehot.append(action_onehot)
             state = apply_action(state, action)
             move_index += 1
 
@@ -592,11 +657,13 @@ class SelfPlayTrainer:
         outcomes = np.array(
             [0.0 if win == EMPTY else (1.0 if p == win else -1.0) for p in players], dtype=np.float32
         )
+        policy_weights = outcomes.copy()
         return (
             np.stack(game_states).astype(np.float32),
             np.stack(game_masks).astype(np.float32),
-            np.stack(game_policies).astype(np.float32),
+            np.stack(game_actions_onehot).astype(np.float32),
             outcomes,
+            policy_weights,
         )
 
     def train(
@@ -610,29 +677,33 @@ class SelfPlayTrainer:
     ) -> None:
         replay_states: List[np.ndarray] = []
         replay_masks: List[np.ndarray] = []
-        replay_policies: List[np.ndarray] = []
+        replay_actions: List[np.ndarray] = []
         replay_values: List[np.ndarray] = []
+        replay_policy_weights: List[np.ndarray] = []
 
         for it in range(1, iterations + 1):
             for _ in range(games_per_iteration):
-                states, masks, policies, values = self.self_play_game()
+                states, masks, actions, values, policy_weights = self.self_play_game()
                 replay_states.append(states)
                 replay_masks.append(masks)
-                replay_policies.append(policies)
+                replay_actions.append(actions)
                 replay_values.append(values)
+                replay_policy_weights.append(policy_weights)
 
             states_all = np.concatenate(replay_states, axis=0)
             masks_all = np.concatenate(replay_masks, axis=0)
-            policies_all = np.concatenate(replay_policies, axis=0)
+            actions_all = np.concatenate(replay_actions, axis=0)
             values_all = np.concatenate(replay_values, axis=0)
+            policy_weights_all = np.concatenate(replay_policy_weights, axis=0)
 
             n = states_all.shape[0]
             if n > max_replay_samples:
                 pick = np.random.choice(n, size=max_replay_samples, replace=False)
                 states_all = states_all[pick]
                 masks_all = masks_all[pick]
-                policies_all = policies_all[pick]
+                actions_all = actions_all[pick]
                 values_all = values_all[pick]
+                policy_weights_all = policy_weights_all[pick]
                 n = max_replay_samples
 
             if it > 1:
@@ -646,9 +717,10 @@ class SelfPlayTrainer:
                     batch_idx = idx[start:start + batch_size]
                     loss = self.net.train_batch(
                         states_all[batch_idx],
-                        policies_all[batch_idx],
+                        actions_all[batch_idx],
                         values_all[batch_idx],
                         masks_all[batch_idx],
+                        policy_weight=policy_weights_all[batch_idx],
                     )
                     epoch_loss += loss
                     batches += 1
@@ -666,21 +738,20 @@ if __name__ == "__main__":
         "To play: python reversi.py ===\n",
         flush=True,
     )
-    # CNN + PUCT MCTS self-play (AlphaZero-style). Deeper search via more simulations per move;
-    # slightly wider CNN and more self-play games per iteration than the old laptop defaults.
+    # NN-only self-play (no MCTS): deeper 3-conv trunk, policy sampling + value targets from outcomes.
     network = PolicyValueNet(arch='cnn', conv_channels=64, learning_rate=0.003, seed=42)
     trainer = SelfPlayTrainer(
         network,
-        simulations=SELFPLAY_MCTS_SIMULATIONS_DEFAULT,
+        exploration_eps=SELFPLAY_EXPLORATION_EPS,
         seed=42,
     )
     trainer.train(
-        iterations=14,
-        games_per_iteration=6,
+        iterations=20,
+        games_per_iteration=10,
         batch_size=64,
-        lr_decay=0.988,
-        max_replay_samples=80_000,
-        epochs_per_iteration=1,
+        lr_decay=0.992,
+        max_replay_samples=120_000,
+        epochs_per_iteration=2,
     )
     weights_file = Path(__file__).with_name('reversi_engine_weights.npz')
     np.savez(weights_file, **network.save_dict())
